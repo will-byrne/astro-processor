@@ -1,0 +1,20 @@
+/target
+/result
+.direnv/
+
+# Test data (too large to commit)
+/andromeda/
+/bias/
+/dark bias/
+/darks/
+/light bias/
+
+# Image data and app output
+*.NEF
+*.nef
+*.TIF
+*.tif
+*.tiff
+*.fits
+*.astroproj
+/.astro-cache/

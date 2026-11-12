@@ -1,0 +1,265 @@
+//! Runs the processing stages in order on an image or a region of one.
+
+use super::curves::Lut;
+use super::gradient::{self, GradientModel};
+use super::params::{ProcessParams, Stretch};
+use super::{detail, geometry, stars, tone};
+use crate::image::{Image, luma, median_in_place, median_sigma};
+use rayon::prelude::*;
+
+/// Part of the (geometry-applied) image, in fractions of its width/height.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Region {
+    pub u0: f32,
+    pub v0: f32,
+    pub u1: f32,
+    pub v1: f32,
+}
+
+impl Region {
+    pub const FULL: Region = Region { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0 };
+}
+
+/// Image-wide measurements the per-pixel stages need. Computed once from the
+/// full image so previews and exports agree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Model {
+    pub gradient: Option<GradientModel>,
+    /// Sky background per channel after gradient removal.
+    pub background: [f32; 3],
+    /// Luminance median and noise after the colour stage (what the stretch
+    /// sees).
+    pub lum_median: f32,
+    pub lum_sigma: f32,
+}
+
+#[inline]
+fn color_stage(p: &mut [f32; 3], params: &ProcessParams, bg: &[f32; 3]) {
+    let wb = params.color.wb;
+    if params.color.neutralize_background {
+        let target = (bg[0] + bg[1] + bg[2]) / 3.0;
+        for c in 0..3 {
+            p[c] = (p[c] - bg[c]) * wb[c] + target;
+        }
+    } else {
+        for c in 0..3 {
+            p[c] *= wb[c];
+        }
+    }
+}
+
+/// Measure `img` (the geometry-applied stack at any resolution; full
+/// resolution gives the most faithful noise estimate).
+pub fn analyze(img: &Image, params: &ProcessParams) -> Model {
+    let gradient = gradient::fit(img, &params.gradient);
+    let (w, h) = (img.width, img.height);
+    // Roughly 300k samples regardless of image size.
+    let step = (((w * h) as f32 / 300_000.0).sqrt().ceil() as usize).max(1);
+    let mut ch: [Vec<f32>; 3] = Default::default();
+    for y in (0..h).step_by(step) {
+        for x in (0..w).step_by(step) {
+            let mut p = img.px(x, y);
+            if p == [0.0; 3] {
+                continue; // uncovered
+            }
+            if let Some(g) = &gradient {
+                let d = g.eval((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+                for c in 0..3 {
+                    p[c] -= d[c];
+                }
+            }
+            for c in 0..3 {
+                ch[c].push(p[c]);
+            }
+        }
+    }
+    if ch[0].is_empty() {
+        return Model { gradient, background: [0.0; 3], lum_median: 0.0, lum_sigma: 0.0 };
+    }
+    // The darker half of the image is mostly sky even when the target is
+    // large, so use the lower quartile as the background level.
+    let background = [0, 1, 2].map(|c| {
+        let mut v = ch[c].clone();
+        let q = v.len() / 4;
+        *v.select_nth_unstable_by(q, |a, b| a.total_cmp(b)).1
+    });
+    let mut lum: Vec<f32> = (0..ch[0].len())
+        .map(|i| {
+            let mut p = [ch[0][i], ch[1][i], ch[2][i]];
+            color_stage(&mut p, params, &background);
+            luma(p[0], p[1], p[2])
+        })
+        .collect();
+    // Noise from the sky only: the spread of the darker half about its top.
+    let med = median_in_place(&mut lum);
+    let mut below: Vec<f32> = lum.iter().copied().filter(|&l| l <= med).map(|l| med - l).collect();
+    let half_sigma = 1.4826 * median_in_place(&mut below);
+    let (_, full_sigma) = median_sigma(&mut lum);
+    Model { gradient, background, lum_median: med, lum_sigma: half_sigma.min(full_sigma).max(1e-7) }
+}
+
+/// A stretch that makes the sky dark grey and the target visible.
+pub fn auto_stretch(model: &Model) -> Stretch {
+    tone::auto_stretch(model.lum_median, model.lum_sigma, 0.18, 2.8)
+}
+
+/// Process `img`, which shows `region` of the geometry-applied stack at
+/// `scale` full-resolution pixels per pixel. Output is display-ready 0..1.
+pub fn render(img: &Image, region: Region, scale: f32, params: &ProcessParams, model: &Model) -> Image {
+    let (w, h) = (img.width, img.height);
+    let mut out = Image::new(w, h);
+    let lv = &params.levels;
+    let levels_on = [lv.master, lv.r, lv.g, lv.b].iter().any(|l| !tone::level_is_identity(l));
+    let chan_levels = [lv.r, lv.g, lv.b];
+    let master_lut = Lut::new(&params.curves.master);
+    let chan_luts = [Lut::new(&params.curves.r), Lut::new(&params.curves.g), Lut::new(&params.curves.b)];
+    let tone_on = !tone::tone_is_identity(&params.tone);
+    let (du, dv) = ((region.u1 - region.u0) / w as f32, (region.v1 - region.v0) / h as f32);
+
+    out.data.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        let v = region.v0 + (y as f32 + 0.5) * dv;
+        for x in 0..w {
+            let mut p = img.px(x, y);
+            if p == [0.0; 3] {
+                continue; // uncovered stays black
+            }
+            if let Some(g) = &model.gradient {
+                let d = g.eval(region.u0 + (x as f32 + 0.5) * du, v);
+                for c in 0..3 {
+                    p[c] -= d[c];
+                }
+            }
+            color_stage(&mut p, params, &model.background);
+            tone::apply_stretch(&params.stretch, &mut p);
+            for c in 0..3 {
+                p[c] = p[c].clamp(0.0, 1.0);
+            }
+            if levels_on {
+                for c in 0..3 {
+                    p[c] = tone::apply_level(&chan_levels[c], tone::apply_level(&lv.master, p[c]));
+                }
+            }
+            for c in 0..3 {
+                if let Some(l) = &master_lut {
+                    p[c] = l.apply(p[c]);
+                }
+                if let Some(l) = &chan_luts[c] {
+                    p[c] = l.apply(p[c]);
+                }
+            }
+            if tone_on {
+                tone::apply_tone(&params.tone, &mut p);
+            }
+            for c in 0..3 {
+                row[x * 3 + c] = p[c].clamp(0.0, 1.0);
+            }
+        }
+    });
+    detail::apply(&mut out, &params.detail, scale);
+    stars::apply(&mut out, &params.stars, scale);
+    out
+}
+
+/// Geometry + analysis + full-resolution render: what export does.
+pub fn process_full(stack: &Image, params: &ProcessParams) -> Image {
+    let base = geometry::apply(stack, &params.geometry);
+    let model = analyze(&base, params);
+    render(&base, Region::FULL, 1.0, params, &model)
+}
+
+/// Sensible starting point for a fresh stack: camera white balance, neutral
+/// background, automatic stretch.
+pub fn auto_params(stack: &Image, wb: [f32; 3], crop: Option<[f32; 4]>) -> ProcessParams {
+    let mut p = ProcessParams::default();
+    if let Some(c) = crop {
+        p.geometry.crop = c;
+    }
+    p.color.wb = wb;
+    p.color.neutralize_background = true;
+    let base = geometry::apply(stack, &p.geometry);
+    p.stretch = auto_stretch(&analyze(&base, &p));
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::params::{Gradient, Level};
+
+    /// Linear "stack": tinted noisy sky with a brighter blob.
+    fn stack() -> Image {
+        let (w, h) = (240, 160);
+        let mut img = Image::new(w, h);
+        let mut s = 7u32;
+        for y in 0..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = ((s >> 8) as f32 / (1 << 24) as f32 - 0.5) * 0.002;
+                let d2 = ((x as f32 - 120.0) / 30.0).powi(2) + ((y as f32 - 80.0) / 20.0).powi(2);
+                let obj = 0.05 * (-d2).exp();
+                let i = (y * w + x) * 3;
+                img.data[i] = 0.010 + n + obj;
+                img.data[i + 1] = 0.020 + n + obj;
+                img.data[i + 2] = 0.015 + n + obj;
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn default_params_are_the_identity() {
+        let img = stack();
+        assert_eq!(process_full(&img, &ProcessParams::default()), img);
+    }
+
+    #[test]
+    fn auto_params_give_a_neutral_dark_sky_and_a_visible_target() {
+        let img = stack();
+        let p = auto_params(&img, [1.0; 3], None);
+        let out = process_full(&img, &p);
+        let sky = out.px(10, 10);
+        assert!((0.08..0.30).contains(&sky[1]), "sky level {sky:?}");
+        assert!((sky[0] - sky[1]).abs() < 0.06 && (sky[2] - sky[1]).abs() < 0.06, "sky tint {sky:?}");
+        let core = out.px(120, 80);
+        assert!(core[1] > sky[1] + 0.4, "core {core:?} vs sky {sky:?}");
+        assert!(out.data.iter().all(|v| (0.0..=1.0).contains(v)));
+    }
+
+    #[test]
+    fn region_render_matches_the_full_render() {
+        let img = stack();
+        let mut p = auto_params(&img, [1.2, 1.0, 1.4], None);
+        p.gradient = Gradient { enabled: true, degree: 2, tolerance: 1.0, strength: 1.0 };
+        p.levels.master = Level { black: 0.02, gamma: 1.1, white: 0.95 };
+        p.curves.master = vec![[0.0, 0.0], [0.3, 0.4], [1.0, 1.0]];
+        p.tone.shadows = 0.3;
+        p.tone.saturation = 1.3;
+        let model = analyze(&img, &p);
+        let full = render(&img, Region::FULL, 1.0, &p, &model);
+        // Render the middle third on its own.
+        let (x0, y0, w, h) = (80, 40, 80, 80);
+        let part = img.crop(x0, y0, w, h);
+        let region = Region { u0: x0 as f32 / 240.0, v0: y0 as f32 / 160.0, u1: (x0 + w) as f32 / 240.0, v1: (y0 + h) as f32 / 160.0 };
+        let got = render(&part, region, 1.0, &p, &model);
+        let want = full.crop(x0, y0, w, h);
+        let worst = got.data.iter().zip(&want.data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(worst < 1e-5, "max difference {worst}");
+    }
+
+    #[test]
+    fn uncovered_pixels_stay_black() {
+        let mut img = stack();
+        img.data[..3].fill(0.0);
+        let out = process_full(&img, &auto_params(&img, [1.0; 3], None));
+        assert_eq!(out.px(0, 0), [0.0; 3]);
+    }
+
+    #[test]
+    fn crop_changes_output_size() {
+        let img = stack();
+        let mut p = ProcessParams::default();
+        p.geometry.crop = [0.25, 0.25, 0.75, 0.75];
+        let out = process_full(&img, &p);
+        assert_eq!((out.width, out.height), (120, 80));
+    }
+}
