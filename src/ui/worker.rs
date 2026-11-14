@@ -14,8 +14,11 @@ use std::sync::{Arc, Condvar, Mutex};
 /// Longest side of the proxy image, in pixels.
 const PROXY_MAX: usize = 1600;
 /// Extra border rendered around a detail region so spatial filters have
-/// context, in output pixels.
+/// context, in output pixels. Large-scale stages ask for more.
 const DETAIL_PAD: usize = 48;
+/// Upper limit on the border, so a huge local-contrast size cannot make the
+/// detail render many times larger than the screen.
+const DETAIL_PAD_MAX: usize = 600;
 
 /// Part of the geometry-applied image to render sharply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,7 +179,7 @@ fn render_detail(base: &Image, d: &DetailRequest, params: &ProcessParams, model:
     if d.w == 0 || d.h == 0 || d.x >= base.width || d.y >= base.height {
         return None;
     }
-    let pad = DETAIL_PAD * s;
+    let pad = process::context_radius(params, s as f32).clamp(DETAIL_PAD, DETAIL_PAD_MAX) * s;
     // Padded source rectangle, clamped to the image and aligned to `s`.
     let x0 = d.x.saturating_sub(pad) / s * s;
     let y0 = d.y.saturating_sub(pad) / s * s;

@@ -10,7 +10,7 @@ pub fn is_identity(s: &Stars) -> bool {
 }
 
 /// Separable square min (or max) filter of the given radius on one plane.
-fn morph(src: &[f32], w: usize, h: usize, radius: usize, take_max: bool) -> Vec<f32> {
+pub(crate) fn morph(src: &[f32], w: usize, h: usize, radius: usize, take_max: bool) -> Vec<f32> {
     let pick = |a: f32, b: f32| if take_max { a.max(b) } else { a.min(b) };
     let mut tmp = vec![0f32; src.len()];
     tmp.par_chunks_mut(w).enumerate().for_each(|(y, row)| {

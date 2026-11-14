@@ -10,7 +10,7 @@ pub fn is_identity(d: &Detail) -> bool {
 }
 
 /// One a trous smoothing step with the B3-spline kernel, holes of `step`.
-fn smooth(src: &[f32], w: usize, h: usize, step: usize) -> Vec<f32> {
+pub(crate) fn smooth(src: &[f32], w: usize, h: usize, step: usize) -> Vec<f32> {
     const K: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
     let reflect = |i: isize, n: usize| -> usize {
         let n = n as isize;

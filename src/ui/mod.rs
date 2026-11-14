@@ -60,6 +60,8 @@ struct ImportOutcome {
     image: Image,
     format: String,
     stretched: bool,
+    /// Starting white balance (also what "reset" goes back to).
+    wb: [f32; 3],
     params: ProcessParams,
 }
 
@@ -563,13 +565,13 @@ impl App {
                     self.io_busy = None;
                     match r {
                         Ok(b) => {
-                            let ImportOutcome { path, image, format, stretched, params } = *b;
+                            let ImportOutcome { path, image, format, stretched, wb, params } = *b;
                             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
                             // A new session: the frames of a previous one
                             // have nothing to do with this image.
                             self.frames = FrameSet::default();
                             self.stack_opts = StackOptions::default();
-                            self.wb = [1.0; 3];
+                            self.wb = wb;
                             self.covered = None;
                             self.project_path = None;
                             self.image_name = path.file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -828,12 +830,12 @@ fn open(path: &Path) -> Event {
         );
     }
     Event::Imported(import::load(path).map_err(|e| format!("{e:#}")).map(|imported| {
-        let import::Imported { image, format, stretched } = imported;
+        let wb = imported.white_balance();
+        let import::Imported { image, format, stretched, .. } = imported;
         // Linear data needs a stretch to be visible at all; a picture that
         // already has one would be blown out by a second.
-        let params =
-            if stretched { ProcessParams::default() } else { pipeline::auto_params(&image, [1.0; 3], None) };
-        Box::new(ImportOutcome { path: path.to_path_buf(), image, format, stretched, params })
+        let params = if stretched { ProcessParams::default() } else { pipeline::auto_params(&image, wb, None) };
+        Box::new(ImportOutcome { path: path.to_path_buf(), image, format, stretched, wb, params })
     }))
 }
 

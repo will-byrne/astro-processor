@@ -2,8 +2,9 @@
 
 use super::curves::Lut;
 use super::gradient::{self, GradientModel};
+use super::ghs::GhsCurve;
 use super::params::{ProcessParams, Stretch};
-use super::{detail, geometry, stars, tone};
+use super::{deconv, detail, geometry, local_contrast, stars, tone};
 use crate::image::{Image, luma, median_in_place, median_sigma};
 use rayon::prelude::*;
 
@@ -103,6 +104,41 @@ pub fn auto_stretch(model: &Model) -> Stretch {
     tone::auto_stretch(model.lum_median, model.lum_sigma, 0.18, 2.8)
 }
 
+/// Sky level as the generalised hyperbolic stretch sees it: after the black
+/// point and arcsinh of `stretch`. Use it as the GHS symmetry point.
+pub fn sky_before_ghs(model: &Model, stretch: &Stretch) -> f32 {
+    let s = Stretch { midtone: 0.5, ..stretch.clone() };
+    let mut p = [model.lum_median; 3];
+    tone::apply_stretch(&s, None, &mut p);
+    p[1].clamp(0.0, 1.0)
+}
+
+/// An automatic generalised hyperbolic stretch: the black point of the
+/// automatic stretch, the symmetry point on the sky, and the strongest
+/// stretch that keeps the sky at `target` brightness. The midtones are left
+/// linear.
+pub fn auto_ghs(model: &Model, target: f32) -> Stretch {
+    let mut s = Stretch { black: auto_stretch(model).black, ..Stretch::default() };
+    let sky = sky_before_ghs(model, &s);
+    s.ghs = super::params::Ghs { local_intensity: 2.0, symmetry: sky, ..Default::default() };
+    // Brightness of the sky rises monotonically with the stretch factor.
+    let sky_out = |stretch: f32| {
+        let g = super::params::Ghs { stretch, ..s.ghs.clone() };
+        GhsCurve::new(&g).map_or(sky, |c| c.apply(sky))
+    };
+    let (mut lo, mut hi) = (0.0f32, 12.0f32);
+    if sky_out(hi) <= target {
+        lo = hi;
+    } else {
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if sky_out(mid) < target { lo = mid } else { hi = mid }
+        }
+    }
+    s.ghs.stretch = lo;
+    s
+}
+
 /// Process `img`, which shows `region` of the geometry-applied stack at
 /// `scale` full-resolution pixels per pixel. Output is display-ready 0..1.
 pub fn render(img: &Image, region: Region, scale: f32, params: &ProcessParams, model: &Model) -> Image {
@@ -116,13 +152,18 @@ pub fn render(img: &Image, region: Region, scale: f32, params: &ProcessParams, m
     let tone_on = !tone::tone_is_identity(&params.tone);
     let (du, dv) = ((region.u1 - region.u0) / w as f32, (region.v1 - region.v0) / h as f32);
 
+    let ghs = GhsCurve::new(&params.stretch.ghs);
+    // Uncovered stack pixels stay black throughout.
+    let covered: Vec<bool> = img.data.par_chunks_exact(3).map(|p| p != [0.0; 3]).collect();
+
+    // Linear stage: gradient and colour.
     out.data.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
         let v = region.v0 + (y as f32 + 0.5) * dv;
         for x in 0..w {
-            let mut p = img.px(x, y);
-            if p == [0.0; 3] {
-                continue; // uncovered stays black
+            if !covered[y * w + x] {
+                continue;
             }
+            let mut p = img.px(x, y);
             if let Some(g) = &model.gradient {
                 let d = g.eval(region.u0 + (x as f32 + 0.5) * du, v);
                 for c in 0..3 {
@@ -130,7 +171,20 @@ pub fn render(img: &Image, region: Region, scale: f32, params: &ProcessParams, m
                 }
             }
             color_stage(&mut p, params, &model.background);
-            tone::apply_stretch(&params.stretch, &mut p);
+            row[x * 3..x * 3 + 3].copy_from_slice(&p);
+        }
+    });
+
+    deconv::apply(&mut out, &covered, &params.deconvolution, scale, model.lum_median, model.lum_sigma);
+
+    // Display stage: stretch and tone.
+    out.data.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            if !covered[y * w + x] {
+                continue;
+            }
+            let mut p = [row[x * 3], row[x * 3 + 1], row[x * 3 + 2]];
+            tone::apply_stretch(&params.stretch, ghs.as_ref(), &mut p);
             for c in 0..3 {
                 p[c] = p[c].clamp(0.0, 1.0);
             }
@@ -155,9 +209,16 @@ pub fn render(img: &Image, region: Region, scale: f32, params: &ProcessParams, m
             }
         }
     });
+    local_contrast::apply(&mut out, &covered, &params.local_contrast, scale);
     detail::apply(&mut out, &params.detail, scale);
     stars::apply(&mut out, &params.stars, scale);
     out
+}
+
+/// Pixels of surrounding context (at `scale`) a region needs for its
+/// spatial filters to match a full render.
+pub fn context_radius(params: &ProcessParams, scale: f32) -> usize {
+    deconv::context(&params.deconvolution, scale).max(local_contrast::context(&params.local_contrast, scale))
 }
 
 /// Geometry + analysis + full-resolution render: what export does.
@@ -244,6 +305,43 @@ mod tests {
         let want = full.crop(x0, y0, w, h);
         let worst = got.data.iter().zip(&want.data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
         assert!(worst < 1e-5, "max difference {worst}");
+    }
+
+    #[test]
+    fn padded_region_matches_the_full_render_with_spatial_stages() {
+        let img = stack();
+        let mut p = auto_params(&img, [1.0; 3], None);
+        p.deconvolution = crate::process::params::Deconvolution { amount: 1.0, psf_fwhm: 3.0, ..Default::default() };
+        p.local_contrast = crate::process::params::LocalContrast { amount: 0.5, hdr: 0.5, size: 16.0 };
+        p.stretch.ghs = crate::process::params::Ghs { stretch: 2.0, local_intensity: 1.0, ..Default::default() };
+        let model = analyze(&img, &p);
+        let full = render(&img, Region::FULL, 1.0, &p, &model);
+        let pad = context_radius(&p, 1.0);
+        assert!(pad > 0);
+        let (x0, y0, w, h) = (100, 60, 40, 40);
+        let (px0, py0) = (x0 - pad.min(x0), y0 - pad.min(y0));
+        let (px1, py1) = ((x0 + w + pad).min(240), (y0 + h + pad).min(160));
+        let part = img.crop(px0, py0, px1 - px0, py1 - py0);
+        let region = Region { u0: px0 as f32 / 240.0, v0: py0 as f32 / 160.0, u1: px1 as f32 / 240.0, v1: py1 as f32 / 160.0 };
+        let got = render(&part, region, 1.0, &p, &model).crop(x0 - px0, y0 - py0, w, h);
+        let want = full.crop(x0, y0, w, h);
+        let worst = got.data.iter().zip(&want.data).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(worst < 2e-3, "max difference {worst}");
+        assert_ne!(full, process_full(&img, &auto_params(&img, [1.0; 3], None)), "stages had an effect");
+    }
+
+    #[test]
+    fn auto_ghs_puts_the_sky_at_the_target_and_shows_the_target() {
+        let img = stack();
+        let mut p = auto_params(&img, [1.0; 3], None);
+        p.stretch = auto_ghs(&analyze(&img, &p), 0.15);
+        assert!(p.stretch.ghs.stretch > 0.0 && p.stretch.midtone == 0.5);
+        let out = process_full(&img, &p);
+        // The sky median sits near the target (individual pixels are noisy).
+        let mut sky: Vec<f32> = (0..40).flat_map(|y| (0..40).map(move |x| (x, y))).map(|(x, y)| out.px(x, y)[1]).collect();
+        let m = crate::image::median_in_place(&mut sky);
+        assert!((m - 0.15).abs() < 0.04, "sky {m}");
+        assert!(out.px(120, 80)[1] > m + 0.3, "core {:?}", out.px(120, 80));
     }
 
     #[test]

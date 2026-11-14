@@ -3,7 +3,8 @@
 use super::{App, curve_editor, histogram_view};
 use astro_processor::io::import;
 use astro_processor::process::params::{self, Level, ProcessParams};
-use astro_processor::process::pipeline;
+use astro_processor::image::Image;
+use astro_processor::process::{color, pipeline};
 use eframe::egui::{self, Color32, RichText};
 use std::ops::RangeInclusive;
 
@@ -49,6 +50,15 @@ fn channel_picker(ui: &mut egui::Ui, selected: &mut usize) {
     });
 }
 
+/// Fill in the star size for deconvolution from the image.
+fn measure_psf(d: &mut params::Deconvolution, stack: Option<&Image>, note: &mut Option<(String, bool)>) {
+    let Some(img) = stack else { return };
+    match astro_processor::process::deconv::measure_fwhm(img) {
+        Some(f) => d.psf_fwhm = f,
+        None => *note = Some(("Too few stars to measure their size; set the star size by hand.".into(), false)),
+    }
+}
+
 impl App {
     pub(super) fn process_panel(&mut self, ui: &mut egui::Ui) {
         if self.stack.is_none() {
@@ -83,6 +93,8 @@ impl App {
         let stack_size = self.stack.as_ref().map(|s| (s.width as f32, s.height as f32)).unwrap_or((1.0, 1.0));
         let wb = self.wb;
         let hist = self.histogram.clone();
+        let stack = self.stack.clone();
+        let stretched = stack.as_ref().is_some_and(|s| import::looks_stretched(s));
         let p: &mut ProcessParams = &mut self.params;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -101,6 +113,47 @@ impl App {
                     .on_hover_text("Level that maps to mid-grey. Lower brightens faint detail; 0.5 is no stretch.");
                 ui.add(egui::Slider::new(&mut s.asinh, 0.0..=1000.0).logarithmic(true).smallest_positive(1.0).fixed_decimals(0).text("Arcsinh"))
                     .on_hover_text("Extra stretch that keeps star colours from washing out. 0 is off.");
+
+                let ghs_on = s.ghs.stretch > 0.0;
+                let title = if ghs_on { "Hyperbolic stretch (GHS)  •" } else { "Hyperbolic stretch (GHS)" };
+                egui::CollapsingHeader::new(title).id_salt("ghs").default_open(ghs_on).show(ui, |ui| {
+                    if ui
+                        .add_enabled(model.is_some(), egui::Button::new("Auto GHS"))
+                        .on_hover_text("Replace the stretch with a generalised hyperbolic stretch centred on the sky background")
+                        .clicked()
+                        && let Some(m) = &model {
+                            *s = pipeline::auto_ghs(m, 0.15);
+                            self.edit_label = Some("Auto GHS");
+                        }
+                    let g = &mut s.ghs;
+                    slider(ui, &mut g.stretch, 0.0..=10.0, 0.0, "Stretch ln(D+1)")
+                        .on_hover_text("Strength of the stretch. 0 is off.");
+                    slider(ui, &mut g.local_intensity, -5.0..=15.0, 0.0, "Local intensity (b)")
+                        .on_hover_text("How tightly the stretch is focused on the symmetry point: higher adds contrast there and leaves the rest more alone.");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Slider::new(&mut g.symmetry, 0.0..=1.0).logarithmic(true).smallest_positive(1e-4).fixed_decimals(4).text("Symmetry point"))
+                            .on_hover_text("Level where the stretch is strongest; usually the sky background.");
+                    });
+                    if ui
+                        .add_enabled(model.is_some(), egui::Button::new("Symmetry point from sky").small())
+                        .clicked()
+                        && let Some(m) = &model {
+                            let sky = pipeline::sky_before_ghs(m, s);
+                            s.ghs.symmetry = sky;
+                            self.edit_label = Some("GHS symmetry point from sky");
+                        }
+                    let g = &mut s.ghs;
+                    let sp = g.symmetry;
+                    ui.add(egui::Slider::new(&mut g.shadow_protect, 0.0..=sp.max(1e-4)).fixed_decimals(4).text("Shadow protection"))
+                        .on_hover_text("Below this level the curve is linear, so the darkest tones are not stretched.");
+                    ui.add(egui::Slider::new(&mut g.highlight_protect, sp..=1.0).fixed_decimals(3).text("Highlight protection"))
+                        .on_hover_text("Above this level the curve is linear, keeping stars and bright cores from saturating.");
+                    g.shadow_protect = g.shadow_protect.min(g.symmetry);
+                    g.highlight_protect = g.highlight_protect.max(g.symmetry);
+                    ui.checkbox(&mut g.preserve_color, "Preserve colour")
+                        .on_hover_text("Stretch all channels by the same factor so stars and nebulae keep their colour.");
+                    ui.label(RichText::new("Set Midtones to 0.5 when the GHS does all the stretching.").weak().small());
+                });
             });
 
             section(ui, "Tone", true, &mut p.tone, |ui, t| {
@@ -111,6 +164,18 @@ impl App {
                 slider(ui, &mut t.saturation, 0.0..=3.0, 1.0, "Saturation");
                 slider(ui, &mut t.green_removal, 0.0..=1.0, 0.0, "Green removal")
                     .on_hover_text("Removes the green cast typical of colour cameras.");
+            });
+
+            section(ui, "Local contrast & HDR", false, &mut p.local_contrast, |ui, lc| {
+                slider(ui, &mut lc.amount, 0.0..=1.0, 0.0, "Local contrast")
+                    .on_hover_text("Brings out structure such as dust lanes and nebula filaments. Stars are left alone.");
+                slider(ui, &mut lc.hdr, 0.0..=1.0, 0.0, "HDR")
+                    .on_hover_text("Brings bright areas such as galaxy cores and the heart of the Orion Nebula down, revealing the detail in them.");
+                let r = ui.add(egui::Slider::new(&mut lc.size, 8.0..=512.0).logarithmic(true).fixed_decimals(0).suffix(" px").text("Structure size"));
+                if r.double_clicked() {
+                    lc.size = params::LocalContrast::default().size;
+                }
+                r.on_hover_text("Size of the structures to enhance; anything larger counts as the background brightness that HDR compresses.");
             });
 
             section(ui, "Levels", false, &mut p.levels, |ui, l| {
@@ -171,6 +236,19 @@ impl App {
                         c.wb = [1.0; 3];
                         self.edit_label = Some("Equal white balance");
                     }
+                    if ui
+                        .add_enabled(!stretched, egui::Button::new("From stars").small())
+                        .on_hover_text("Measure the white balance that makes the average star white (linear images only)")
+                        .clicked()
+                        && let Some(img) = &stack {
+                            match color::star_white_balance(img) {
+                                Some(wb) => {
+                                    c.wb = wb;
+                                    self.edit_label = Some("White balance from stars");
+                                }
+                                None => self.status = Some(("Too few unsaturated stars to measure a white balance.".into(), false)),
+                            }
+                        }
                 });
             });
 
@@ -185,6 +263,30 @@ impl App {
                     slider(ui, &mut g.strength, 0.0..=1.0, 1.0, "Strength");
                 });
                 ui.label(RichText::new("Press Auto stretch again after changing this.").weak().small());
+            });
+
+            section(ui, "Deconvolution", false, &mut p.deconvolution, |ui, d| {
+                let r = slider(ui, &mut d.amount, 0.0..=1.0, 0.0, "Amount")
+                    .on_hover_text("Undoes some of the blur from seeing and optics. Works on the linear data, before the stretch.");
+                // Turning it on for the first time needs the star size.
+                if (r.changed() || r.drag_stopped()) && d.amount > 0.0 && !(d.psf_fwhm > 0.0) {
+                    measure_psf(d, stack.as_deref(), &mut self.status);
+                }
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut d.psf_fwhm, 0.5..=12.0).fixed_decimals(2).suffix(" px").text("Star size (FWHM)"))
+                        .on_hover_text("Width of a star at half its peak, at full resolution.");
+                });
+                if ui.small_button("Measure from stars").clicked() {
+                    measure_psf(d, stack.as_deref(), &mut self.status);
+                    self.edit_label = Some("Measure star size");
+                }
+                ui.add(egui::Slider::new(&mut d.iterations, 1..=100).text("Iterations"))
+                    .on_hover_text("More is sharper but slower and more prone to artefacts.");
+                slider(ui, &mut d.noise_protection, 0.0..=10.0, 3.0, "Noise protection")
+                    .on_hover_text("How far above the sky noise the signal must be before it is deconvolved. Higher keeps the background smoother.");
+                slider(ui, &mut d.deringing, 0.0..=1.0, 1.0, "Deringing")
+                    .on_hover_text("Prevents dark rings around stars.");
+                ui.label(RichText::new("Zoom to 1:1 to judge this accurately.").weak().small());
             });
 
             section(ui, "Noise reduction & sharpening", false, &mut p.detail, |ui, d| {

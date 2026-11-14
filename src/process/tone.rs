@@ -1,6 +1,7 @@
 //! Point operations: stretch, levels, exposure, contrast, highlights,
 //! shadows, saturation, green removal.
 
+use super::ghs::GhsCurve;
 use super::params::{Level, Stretch, Tone};
 use crate::image::luma;
 
@@ -24,11 +25,11 @@ pub fn auto_stretch(median: f32, sigma: f32, target: f32, shadow_sigma: f32) -> 
     let x0 = ((median - black) / (1.0 - black)).clamp(1e-6, 0.999);
     // mtf(m, x0) = target  <=>  m = mtf(target, x0)
     let midtone = mtf(target, x0).clamp(1e-5, 0.999);
-    Stretch { black, midtone, asinh: 0.0 }
+    Stretch { black, midtone, ..Stretch::default() }
 }
 
 #[inline]
-pub fn apply_stretch(s: &Stretch, p: &mut [f32; 3]) {
+pub fn apply_stretch(s: &Stretch, ghs: Option<&GhsCurve>, p: &mut [f32; 3]) {
     let inv = 1.0 / (1.0 - s.black).max(1e-6);
     for v in p.iter_mut() {
         *v = ((*v - s.black) * inv).max(0.0);
@@ -42,6 +43,9 @@ pub fn apply_stretch(s: &Stretch, p: &mut [f32; 3]) {
                 *v *= k;
             }
         }
+    }
+    if let Some(curve) = ghs {
+        super::ghs::apply(curve, s.ghs.preserve_color, p);
     }
     if s.midtone != 0.5 {
         for v in p.iter_mut() {
@@ -141,29 +145,29 @@ mod tests {
         let s = auto_stretch(0.016, 0.001, 0.2, 2.8);
         assert!((s.black - 0.0132).abs() < 1e-5);
         let mut p = [0.016; 3];
-        apply_stretch(&s, &mut p);
+        apply_stretch(&s, None, &mut p);
         assert!((p[0] - 0.2).abs() < 1e-4, "{}", p[0]);
         let mut dark = [0.012; 3];
-        apply_stretch(&s, &mut dark);
+        apply_stretch(&s, None, &mut dark);
         assert_eq!(dark, [0.0; 3]);
     }
 
     #[test]
     fn asinh_preserves_colour_ratios() {
-        let s = Stretch { black: 0.0, midtone: 0.5, asinh: 200.0 };
+        let s = Stretch { asinh: 200.0, ..Stretch::default() };
         let mut p = [0.02, 0.01, 0.005];
-        apply_stretch(&s, &mut p);
+        apply_stretch(&s, None, &mut p);
         assert!(p[0] > 0.1, "stretched: {p:?}");
         assert!((p[0] / p[1] - 2.0).abs() < 1e-4 && (p[1] / p[2] - 2.0).abs() < 1e-4);
         let mut white = [1.0; 3];
-        apply_stretch(&s, &mut white);
+        apply_stretch(&s, None, &mut white);
         assert!((white[0] - 1.0).abs() < 1e-5);
     }
 
     #[test]
     fn defaults_are_identity() {
         let mut p = [0.1, 0.5, 0.9];
-        apply_stretch(&Stretch::default(), &mut p);
+        apply_stretch(&Stretch::default(), None, &mut p);
         apply_tone(&Tone::default(), &mut p);
         assert_eq!(p, [0.1, 0.5, 0.9]);
         assert_eq!(apply_level(&Level::default(), 0.37), 0.37);

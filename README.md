@@ -38,9 +38,17 @@ through XWayland, where it is.
    frame, a "keep best N %" filter and hot-pixel repair. After stacking, the
    Files tab shows star count, FWHM and a quality score for every light.
 3. **Process** – everything here is non-destructive and applied live:
-   stretch, tone (exposure, contrast, highlights, shadows, saturation, green
-   removal), levels, curves, colour balance, background gradient removal,
-   noise reduction and sharpening, star reduction, crop and rotate.
+   stretch (midtones, arcsinh, and a generalised hyperbolic stretch with an
+   *Auto GHS* button), tone (exposure, contrast, highlights, shadows,
+   saturation, green removal), local contrast and HDR, levels, curves,
+   colour balance (including white balance measured from the stars),
+   background gradient removal, deconvolution, noise reduction and
+   sharpening, star reduction, crop and rotate.
+   *Deconvolution* (Richardson–Lucy) works on the linear data before the
+   stretch; turning it on measures the star size from the image. It
+   leaves the sky alone and stops dark rings forming around stars.
+   *Local contrast & HDR* brings out dust lanes and filaments and
+   brings bright cores (M31, M42) down without boosting the stars.
    Double-click a slider to reset it. *Before* shows the image without the
    adjustments. Scroll to zoom, drag to pan, double-click to toggle fit/1:1.
    The *History* panel on the right lists every change with when it was
@@ -51,8 +59,12 @@ through XWayland, where it is.
    window, or `astro-processor stacked.tif`) loads a stack made elsewhere,
    e.g. DeepSkyStacker's `Autosave.tif`, straight into the Process tab; no
    light or calibration frames are needed. TIFF (8/16/32-bit and float),
-   FITS, PNG and JPEG are read. Linear stacks get the automatic stretch;
-   pictures that are already stretched are shown as they are.
+   FITS, PNG and JPEG are read. Linear stacks get the automatic stretch and
+   a white balance measured from the stars (so the typical star is white;
+   stacks from this app keep the camera white balance they were saved
+   with); pictures that are already stretched are shown as they are.
+   Stacks with vignetting or light pollution usually need *Background
+   gradient* turned on as well.
 4. **Export** – 16-bit TIFF or PNG, JPEG, or 32-bit FITS; *Export linear*
    writes the unprocessed stack as FITS for other astronomy software.
    *Save* writes a `.astroproj` project plus the stack next to it
@@ -73,25 +85,35 @@ through XWayland, where it is.
 
 ## Test data
 
-These folders sit in the repository root during development and are ignored
-by git:
+These folders sit in `test-data/` during development and are ignored by
+git:
 
-| Folder       | Slot       | Contents                                   |
-|--------------|------------|--------------------------------------------|
-| `andromeda/` | Lights     | 123 NEF, 108 of them ~60 s at ISO 800      |
-| `darks/`     | Darks      | 10 NEF, 60 s, ISO 1600                     |
-| `bias/`      | Flats      | 45 NEF, 1/2500 s, ISO 1600, evenly lit     |
-| `dark bias/` | Dark-flats | 45 NEF, 1/2500 s, ISO 1600, lens covered   |
+| Folder         | Slot       | Contents                                   |
+|----------------|------------|--------------------------------------------|
+| `andromeda/`   | Lights     | 123 NEF, 108 of them ~60 s at ISO 800      |
+| `darks/`       | Darks      | 10 NEF, 60 s, ISO 1600                     |
+| `bias/`        | Flats      | 45 NEF, 1/2500 s, ISO 1600, evenly lit     |
+| `dark bias/`   | Dark-flats | 45 NEF, 1/2500 s, ISO 1600, lens covered   |
+| `pre-stacked/` | Open image | Finished stacks: PixInsight FITS (32-bit integer and float, Canon DSLR and ZWO OSC), DeepSkyStacker 32-bit float TIFFs, and an Orion L/R/G/B set of mono masters (TIFF and XISF) |
 
 (The folder names predate this project; the slot column is what the frames
 actually are.) End-to-end run:
 
 ```sh
+cd test-data
 cargo run --release --bin astro-cli -- stack \
     --lights andromeda --darks darks --flats bias --dark-flats "dark bias" \
     -o m31.fits --project m31.astroproj
 cargo run --release --bin astro-cli -- process m31.fits -o m31.jpg
 cargo run --release -- m31.astroproj      # continue in the app
+
+# An image stacked elsewhere:
+cargo run --release --bin astro-cli -- process --gradient \
+    pre-stacked/c49_9h_stacked.fit -o c49.jpg
+
+# With the extra processing tools (see `process --help`):
+cargo run --release --bin astro-cli -- process --gradient --deconv 0.8 \
+    --local-contrast 0.5 --hdr 0.6 pre-stacked/andromeda_11h_stacked.fit -o m31.jpg
 ```
 
 ## Limitations
@@ -106,6 +128,9 @@ cargo run --release -- m31.astroproj      # continue in the app
 
 - `src/lib.rs` and its modules – all image processing, no GUI dependency:
   `io` (RAW, FITS, export, projects), `frames`, `calibrate`, `debayer`,
-  `register`, `combine`, `stack`, `process`, `histogram`.
+  `register`, `combine`, `stack`, `process`, `histogram`. Processing
+  stages live in `src/process/`, one module each (`ghs`, `deconv`,
+  `local_contrast`, `gradient`, `detail`, `stars`, ...), run in order by
+  `pipeline.rs`.
 - `src/bin/astro-cli.rs` – command-line front end.
 - `src/main.rs`, `src/ui/` – the egui application.

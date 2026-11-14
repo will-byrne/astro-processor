@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use astro_processor::frames::{self, FrameKind, FrameSet, fmt_exposure, fmt_iso};
-use astro_processor::io::export;
+use astro_processor::io::{export, import};
 use astro_processor::process::{self, ProcessParams, pipeline};
 use astro_processor::progress::Progress;
 use astro_processor::stack::{self, StackMethod, StackOptions};
@@ -68,18 +68,34 @@ enum Command {
     Match { reference: PathBuf, frame: PathBuf },
     /// Turn a linear stack (FITS from `stack`) into a finished image.
     Process {
-        /// Linear stack written by `stack`.
+        /// Linear stack: a FITS written by `stack`, or a stack from other
+        /// software (TIFF, FITS, PNG, JPEG).
         input: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
         /// Processing parameters as JSON (the "params" object of a project
-        /// file). Without it: camera white balance, neutral background,
-        /// automatic stretch and crop to the fully covered area.
+        /// file). Without it: camera white balance (or one measured from the
+        /// stars), neutral background, automatic stretch and crop to the
+        /// fully covered area.
         #[arg(long)]
         params: Option<PathBuf>,
         /// Also remove background gradients (with automatic parameters).
         #[arg(long)]
         gradient: bool,
+        /// Stretch with an automatic generalised hyperbolic stretch instead
+        /// of the midtones stretch.
+        #[arg(long)]
+        ghs: bool,
+        /// Deconvolve with this strength (0..1), using the star size
+        /// measured from the image.
+        #[arg(long, value_name = "AMOUNT")]
+        deconv: Option<f32>,
+        /// Boost large-scale local contrast (0..1).
+        #[arg(long, value_name = "AMOUNT")]
+        local_contrast: Option<f32>,
+        /// Compress bright large areas such as galaxy cores (0..1).
+        #[arg(long, value_name = "AMOUNT")]
+        hdr: Option<f32>,
     },
 }
 
@@ -244,16 +260,15 @@ fn main() -> Result<()> {
                 None => println!("no match"),
             }
         }
-        Command::Process { input, output, params, gradient } => {
-            let (stack, header) = export::load_fits(&input)?;
+        Command::Process { input, output, params, gradient, ghs, deconv, local_contrast, hdr } => {
+            let imported = import::load(&input)?;
+            let header = &imported;
             let mut p = match params {
                 Some(path) => serde_json::from_str::<ProcessParams>(&std::fs::read_to_string(&path)?)?,
+                None if imported.stretched => ProcessParams::default(),
                 None => {
-                    let wb = [
-                        header.card_f32("WB_R").unwrap_or(1.0),
-                        header.card_f32("WB_G").unwrap_or(1.0),
-                        header.card_f32("WB_B").unwrap_or(1.0),
-                    ];
+                    let wb = imported.white_balance();
+                    let stack = &imported.image;
                     let (w, h) = (stack.width as f32, stack.height as f32);
                     let crop = match (
                         header.card_f32("CROP_X"),
@@ -264,16 +279,37 @@ fn main() -> Result<()> {
                         (Some(x), Some(y), Some(cw), Some(ch)) => Some([x / w, y / h, (x + cw) / w, (y + ch) / h]),
                         _ => None,
                     };
-                    pipeline::auto_params(&stack, wb, crop)
+                    pipeline::auto_params(stack, wb, crop)
                 }
             };
+            let stack = &imported.image;
             if gradient {
                 p.gradient.enabled = true;
-                let base = process::geometry::apply(&stack, &p.geometry);
-                p.stretch = pipeline::auto_stretch(&process::analyze(&base, &p));
+            }
+            if gradient || ghs {
+                let base = process::geometry::apply(stack, &p.geometry);
+                let model = process::analyze(&base, &p);
+                p.stretch = if ghs { pipeline::auto_ghs(&model, 0.15) } else { pipeline::auto_stretch(&model) };
+            }
+            if let Some(amount) = deconv {
+                let t = Instant::now();
+                match process::deconv::measure_fwhm(stack) {
+                    Some(fwhm) => {
+                        println!("star FWHM {fwhm:.2} px (measured in {:.1}s)", t.elapsed().as_secs_f32());
+                        p.deconvolution.amount = amount;
+                        p.deconvolution.psf_fwhm = fwhm;
+                    }
+                    None => println!("too few stars to measure their size: skipping deconvolution"),
+                }
+            }
+            if let Some(a) = local_contrast {
+                p.local_contrast.amount = a;
+            }
+            if let Some(a) = hdr {
+                p.local_contrast.hdr = a;
             }
             let start = Instant::now();
-            let out = process::process_full(&stack, &p);
+            let out = process::process_full(stack, &p);
             export::save(&output, &out)?;
             println!(
                 "wrote {} ({}x{}) in {:.1}s",

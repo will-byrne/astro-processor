@@ -29,6 +29,27 @@ pub struct Imported {
     /// The image has already been stretched for display, rather than being
     /// linear data straight from a stacking program.
     pub stretched: bool,
+    /// FITS header cards (keyword, value), empty for other formats.
+    pub cards: Vec<(String, String)>,
+}
+
+impl Imported {
+    pub fn card_f32(&self, key: &str) -> Option<f32> {
+        self.cards.iter().find(|(k, _)| k == key)?.1.trim().parse().ok()
+    }
+
+    /// The white balance to start from: the one recorded in the file by this
+    /// program's own stacker, else one measured from the stars (linear data
+    /// only), else none.
+    pub fn white_balance(&self) -> [f32; 3] {
+        if let (Some(r), Some(g), Some(b)) = (self.card_f32("WB_R"), self.card_f32("WB_G"), self.card_f32("WB_B")) {
+            return [r, g, b];
+        }
+        if self.stretched {
+            return [1.0; 3];
+        }
+        crate::process::color::star_white_balance(&self.image).unwrap_or([1.0; 3])
+    }
 }
 
 /// Whether `img` has already been stretched for display.
@@ -68,6 +89,7 @@ struct Samples {
     /// worked out from the data (floating point).
     white: Option<f32>,
     format: String,
+    cards: Vec<(String, String)>,
 }
 
 pub fn load(path: &Path) -> Result<Imported> {
@@ -95,7 +117,7 @@ fn guess_white(max: f32) -> f32 {
 }
 
 fn finish(s: Samples) -> Result<Imported> {
-    let Samples { width, height, channels, mut data, white, format } = s;
+    let Samples { width, height, channels, mut data, white, format, cards } = s;
     if width == 0 || height == 0 || data.len() != width * height * channels {
         bail!("image data does not match its dimensions");
     }
@@ -120,7 +142,7 @@ fn finish(s: Samples) -> Result<Imported> {
     }
     let image = Image { width, height, data: rgb };
     let stretched = looks_stretched(&image);
-    Ok(Imported { image, format, stretched })
+    Ok(Imported { image, format, stretched, cards })
 }
 
 fn load_tiff(path: &Path) -> Result<Samples> {
@@ -148,7 +170,7 @@ fn load_tiff(path: &Path) -> Result<Samples> {
             DecodingResult::F64(v) => (v.into_iter().map(|x| x as f32).collect(), None, "64-bit float"),
             _ => bail!("{}: this TIFF sample format is not supported", path.display()),
         };
-    Ok(Samples { width: w as usize, height: h as usize, channels, data, white, format: format!("{kind} TIFF") })
+    Ok(Samples { width: w as usize, height: h as usize, channels, data, white, format: format!("{kind} TIFF"), cards: Vec::new() })
 }
 
 fn load_fits(path: &Path) -> Result<Samples> {
@@ -167,6 +189,7 @@ fn load_fits(path: &Path) -> Result<Samples> {
         data: f.data,
         white,
         format: format!("{kind} FITS"),
+        cards: f.cards,
     })
 }
 
@@ -188,7 +211,7 @@ fn load_other(path: &Path) -> Result<Samples> {
     } else {
         (img.into_rgb8().into_raw().into_iter().map(f32::from).collect(), 255.0, "8-bit")
     };
-    Ok(Samples { width, height, channels: 3, data, white: Some(white), format: format!("{bits} {name}") })
+    Ok(Samples { width, height, channels: 3, data, white: Some(white), format: format!("{bits} {name}"), cards: Vec::new() })
 }
 
 #[cfg(test)]

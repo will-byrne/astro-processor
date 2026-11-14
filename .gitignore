@@ -3,11 +3,7 @@
 .direnv/
 
 # Test data (too large to commit)
-/andromeda/
-/bias/
-/dark bias/
-/darks/
-/light bias/
+/test-data/
 
 # Image data and app output
 *.NEF
@@ -16,5 +12,7 @@
 *.tif
 *.tiff
 *.fits
+*.fit
+*.xisf
 *.astroproj
 /.astro-cache/

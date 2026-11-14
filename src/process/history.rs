@@ -211,7 +211,9 @@ pub fn describe(a: &ProcessParams, b: &ProcessParams) -> Change {
             }
         };
     }
+    section!(deconvolution, "Deconvolution");
     section!(stretch, "Stretch");
+    section!(local_contrast, "Local contrast & HDR");
     section!(tone, "Tone");
     section!(levels, "Levels");
     section!(curves, "Curves");
@@ -225,6 +227,25 @@ pub fn describe(a: &ProcessParams, b: &ProcessParams) -> Change {
     d.num("Stretch", "Black point", x.black, y.black, 4);
     d.num("Stretch", "Midtones", x.midtone, y.midtone, 4);
     d.num("Stretch", "Arcsinh", x.asinh, y.asinh, 0);
+    let (g, k) = (&x.ghs, &y.ghs);
+    d.num("Stretch", "GHS stretch", g.stretch, k.stretch, 2);
+    d.num("Stretch", "GHS local intensity", g.local_intensity, k.local_intensity, 1);
+    d.num("Stretch", "GHS symmetry point", g.symmetry, k.symmetry, 4);
+    d.num("Stretch", "GHS shadow protection", g.shadow_protect, k.shadow_protect, 4);
+    d.num("Stretch", "GHS highlight protection", g.highlight_protect, k.highlight_protect, 3);
+    d.flag("Stretch", "GHS preserve colour", g.preserve_color, k.preserve_color);
+
+    let (x, y) = (&a.deconvolution, &b.deconvolution);
+    d.num("Deconvolution", "Deconvolution", x.amount, y.amount, 2);
+    d.num("Deconvolution", "Star size (FWHM)", x.psf_fwhm, y.psf_fwhm, 2);
+    d.num("Deconvolution", "Iterations", x.iterations as f32, y.iterations as f32, 0);
+    d.num("Deconvolution", "Noise protection", x.noise_protection, y.noise_protection, 1);
+    d.num("Deconvolution", "Deringing", x.deringing, y.deringing, 2);
+
+    let (x, y) = (&a.local_contrast, &b.local_contrast);
+    d.num("Local contrast & HDR", "Local contrast", x.amount, y.amount, 2);
+    d.num("Local contrast & HDR", "HDR", x.hdr, y.hdr, 2);
+    d.num("Local contrast & HDR", "Structure size", x.size, y.size, 0);
 
     let (x, y) = (&a.tone, &b.tone);
     d.num("Tone", "Exposure", x.exposure, y.exposure, 2);
